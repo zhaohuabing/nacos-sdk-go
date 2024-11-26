@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -40,11 +41,9 @@ var levelMap = map[string]zapcore.Level{
 
 type Config struct {
 	Level            string
-	LogFileName      string
 	Sampling         *SamplingConfig
+	AppendToStdout   bool
 	LogRollingConfig *lumberjack.Logger
-	LogDir           string
-	CustomLogger     Logger
 }
 
 type SamplingConfig struct {
@@ -85,35 +84,53 @@ func init() {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 	zapLoggerConfig.EncoderConfig = zapLoggerEncoderConfig
-	defaultLogger, _ := zapLoggerConfig.Build(zap.AddCaller(), zap.AddCallerSkip(1))
-	setLogger(&NacosLogger{defaultLogger.Sugar()})
+	zapLogger, _ := zapLoggerConfig.Build(zap.AddCaller(), zap.AddCallerSkip(1))
+	SetLogger(&NacosLogger{zapLogger.Sugar()})
+}
+
+func BuildLoggerConfig(clientConfig constant.ClientConfig) Config {
+	loggerConfig := Config{
+		Level:          clientConfig.LogLevel,
+		AppendToStdout: clientConfig.AppendToStdout,
+	}
+	if clientConfig.LogSampling != nil {
+		loggerConfig.Sampling = &SamplingConfig{
+			Initial:    clientConfig.LogSampling.Initial,
+			Thereafter: clientConfig.LogSampling.Thereafter,
+			Tick:       clientConfig.LogSampling.Tick,
+		}
+	}
+	loggerConfig.LogRollingConfig = &lumberjack.Logger{
+		Filename: clientConfig.LogDir + string(os.PathSeparator) + constant.LOG_FILE_NAME,
+	}
+	logRollingConfig := clientConfig.LogRollingConfig
+	if logRollingConfig != nil {
+		loggerConfig.LogRollingConfig.MaxSize = logRollingConfig.MaxSize
+		loggerConfig.LogRollingConfig.MaxAge = logRollingConfig.MaxAge
+		loggerConfig.LogRollingConfig.MaxBackups = logRollingConfig.MaxBackups
+		loggerConfig.LogRollingConfig.LocalTime = logRollingConfig.LocalTime
+		loggerConfig.LogRollingConfig.Compress = logRollingConfig.Compress
+	}
+	return loggerConfig
 }
 
 // InitLogger is init global logger for nacos
 func InitLogger(config Config) (err error) {
-	l, err := initNacosLogger(config)
-	if err != nil {
-		return err
-	}
-	setLogger(l)
+	logLock.Lock()
+	defer logLock.Unlock()
+	logger, err = InitNacosLogger(config)
 	return
 }
 
 // InitNacosLogger is init nacos default logger
-func initNacosLogger(config Config) (Logger, error) {
-	if config.CustomLogger != nil {
-		return &NacosLogger{config.CustomLogger}, nil
-	}
+func InitNacosLogger(config Config) (Logger, error) {
 	logLevel := getLogLevel(config.Level)
 	encoder := getEncoder()
 	writer := config.getLogWriter()
-
-	core := zapcore.NewCore(zapcore.NewConsoleEncoder(encoder), zapcore.NewMultiWriteSyncer(writer, zapcore.AddSync(os.Stdout)), logLevel)
-
-	if config.Sampling != nil {
-		core = zapcore.NewSamplerWithOptions(core, config.Sampling.Tick, config.Sampling.Initial, config.Sampling.Thereafter)
+	if config.AppendToStdout {
+		writer = zapcore.NewMultiWriteSyncer(writer, zapcore.AddSync(os.Stdout))
 	}
-
+	core := zapcore.NewCore(zapcore.NewConsoleEncoder(encoder), writer, logLevel)
 	zaplogger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
 	return &NacosLogger{zaplogger.Sugar()}, nil
 }
@@ -133,15 +150,15 @@ func getEncoder() zapcore.EncoderConfig {
 		CallerKey:      "caller",
 		MessageKey:     "message",
 		StacktraceKey:  "stacktrace",
-		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
 		EncodeTime:     zapcore.ISO8601TimeEncoder,
 		EncodeDuration: zapcore.SecondsDurationEncoder,
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 }
 
-//SetLogger sets logger for sdk
-func setLogger(log Logger) {
+// SetLogger sets logger for sdk
+func SetLogger(log Logger) {
 	logLock.Lock()
 	defer logLock.Unlock()
 	logger = log
@@ -155,9 +172,5 @@ func GetLogger() Logger {
 
 // getLogWriter get Lumberjack writer by LumberjackConfig
 func (c *Config) getLogWriter() zapcore.WriteSyncer {
-	if c.LogRollingConfig == nil {
-		c.LogRollingConfig = &lumberjack.Logger{}
-	}
-	c.LogRollingConfig.Filename = c.LogDir + string(os.PathSeparator) + c.LogFileName
 	return zapcore.AddSync(c.LogRollingConfig)
 }

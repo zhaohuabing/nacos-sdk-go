@@ -17,20 +17,28 @@
 package http_agent
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 
-	"github.com/go-errors/errors"
-	"github.com/nacos-group/nacos-sdk-go/common/logger"
-	"github.com/nacos-group/nacos-sdk-go/util"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/tls"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v2/util"
+	"github.com/pkg/errors"
 )
 
 type HttpAgent struct {
+	TlsConfig constant.TLSConfig
 }
 
 func (agent *HttpAgent) Get(path string, header http.Header, timeoutMs uint64,
 	params map[string]string) (response *http.Response, err error) {
-	return get(path, header, timeoutMs, params)
+	client, err := agent.createClient()
+	if err != nil {
+		return nil, err
+	}
+	return get(client, path, header, timeoutMs, params)
 }
 
 func (agent *HttpAgent) RequestOnlyResult(method string, path string, header http.Header, timeoutMs uint64, params map[string]string) string {
@@ -56,11 +64,11 @@ func (agent *HttpAgent) RequestOnlyResult(method string, path string, header htt
 		logger.Errorf("request method[%s],request path[%s],header:[%s],params:[%s],err:%+v", method, path, util.ToJsonString(header), util.ToJsonString(params), err)
 		return ""
 	}
-	if response.StatusCode != 200 {
+	if response.StatusCode != constant.RESPONSE_CODE_SUCCESS {
 		logger.Errorf("request method[%s],request path[%s],header:[%s],params:[%s],status code error:%d", method, path, util.ToJsonString(header), util.ToJsonString(params), response.StatusCode)
 		return ""
 	}
-	bytes, errRead := ioutil.ReadAll(response.Body)
+	bytes, errRead := io.ReadAll(response.Body)
 	defer response.Body.Close()
 	if errRead != nil {
 		logger.Errorf("request method[%s],request path[%s],header:[%s],params:[%s],read error:%+v", method, path, util.ToJsonString(header), util.ToJsonString(params), errRead)
@@ -92,13 +100,37 @@ func (agent *HttpAgent) Request(method string, path string, header http.Header, 
 }
 func (agent *HttpAgent) Post(path string, header http.Header, timeoutMs uint64,
 	params map[string]string) (response *http.Response, err error) {
-	return post(path, header, timeoutMs, params)
+	client, err := agent.createClient()
+	if err != nil {
+		return nil, err
+	}
+	return post(client, path, header, timeoutMs, params)
 }
 func (agent *HttpAgent) Delete(path string, header http.Header, timeoutMs uint64,
 	params map[string]string) (response *http.Response, err error) {
-	return delete(path, header, timeoutMs, params)
+	client, err := agent.createClient()
+	if err != nil {
+		return nil, err
+	}
+	return delete(client, path, header, timeoutMs, params)
 }
 func (agent *HttpAgent) Put(path string, header http.Header, timeoutMs uint64,
 	params map[string]string) (response *http.Response, err error) {
-	return put(path, header, timeoutMs, params)
+	client, err := agent.createClient()
+	if err != nil {
+		return nil, err
+	}
+	return put(client, path, header, timeoutMs, params)
+}
+
+func (agent *HttpAgent) createClient() (*http.Client, error) {
+	if !agent.TlsConfig.Enable {
+		return &http.Client{}, nil
+	}
+	cfg, err := tls.NewTLS(agent.TlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}}, nil
+
 }

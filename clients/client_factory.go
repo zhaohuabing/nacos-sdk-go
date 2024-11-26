@@ -17,14 +17,15 @@
 package clients
 
 import (
-	"errors"
+	"github.com/pkg/errors"
 
-	"github.com/nacos-group/nacos-sdk-go/clients/config_client"
-	"github.com/nacos-group/nacos-sdk-go/clients/nacos_client"
-	"github.com/nacos-group/nacos-sdk-go/clients/naming_client"
-	"github.com/nacos-group/nacos-sdk-go/common/constant"
-	"github.com/nacos-group/nacos-sdk-go/common/http_agent"
-	"github.com/nacos-group/nacos-sdk-go/vo"
+	"github.com/nacos-group/nacos-sdk-go/v2/clients/naming_client"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
+	"github.com/nacos-group/nacos-sdk-go/v2/clients/nacos_client"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/http_agent"
+	"github.com/nacos-group/nacos-sdk-go/v2/vo"
 )
 
 // CreateConfigClient use to create config client
@@ -33,7 +34,7 @@ func CreateConfigClient(properties map[string]interface{}) (iClient config_clien
 	return NewConfigClient(param)
 }
 
-//CreateNamingClient use to create a nacos naming client
+// CreateNamingClient use to create a nacos naming client
 func CreateNamingClient(properties map[string]interface{}) (iClient naming_client.INamingClient, err error) {
 	param := getConfigParam(properties)
 	return NewNamingClient(param)
@@ -61,7 +62,7 @@ func NewNamingClient(param vo.NacosClientParam) (iClient naming_client.INamingCl
 	if err != nil {
 		return
 	}
-	iClient = &naming
+	iClient = naming
 	return
 }
 
@@ -84,9 +85,15 @@ func setConfig(param vo.NacosClientParam) (iClient nacos_client.INacosClient, er
 	client := &nacos_client.NacosClient{}
 	if param.ClientConfig == nil {
 		// default clientConfig
-		_ = client.SetClientConfig(constant.ClientConfig{})
+		_ = client.SetClientConfig(constant.ClientConfig{
+			TimeoutMs:    10 * 1000,
+			BeatInterval: 5 * 1000,
+		})
 	} else {
-		_ = client.SetClientConfig(*param.ClientConfig)
+		err = client.SetClientConfig(*param.ClientConfig)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(param.ServerConfigs) == 0 {
@@ -95,8 +102,16 @@ func setConfig(param vo.NacosClientParam) (iClient nacos_client.INacosClient, er
 			err = errors.New("server configs not found in properties")
 			return nil, err
 		}
-		_ = client.SetServerConfig([]constant.ServerConfig{})
+		_ = client.SetServerConfig(nil)
 	} else {
+		for i := range param.ServerConfigs {
+			if param.ServerConfigs[i].Port == 0 {
+				param.ServerConfigs[i].Port = 8848
+			}
+			if param.ServerConfigs[i].GrpcPort == 0 {
+				param.ServerConfigs[i].GrpcPort = param.ServerConfigs[i].Port + constant.RpcPortOffset
+			}
+		}
 		err = client.SetServerConfig(param.ServerConfigs)
 		if err != nil {
 			return nil, err
@@ -104,7 +119,9 @@ func setConfig(param vo.NacosClientParam) (iClient nacos_client.INacosClient, er
 	}
 
 	if _, _err := client.GetHttpAgent(); _err != nil {
-		_ = client.SetHttpAgent(&http_agent.HttpAgent{})
+		if clientCfg, err := client.GetClientConfig(); err == nil {
+			_ = client.SetHttpAgent(&http_agent.HttpAgent{TlsConfig: clientCfg.TLSCfg})
+		}
 	}
 	iClient = client
 	return

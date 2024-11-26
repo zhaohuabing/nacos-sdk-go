@@ -17,18 +17,20 @@
 package security
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/nacos-group/nacos-sdk-go/common/constant"
-	"github.com/nacos-group/nacos-sdk-go/common/http_agent"
-	"github.com/nacos-group/nacos-sdk-go/common/logger"
+	"github.com/pkg/errors"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/http_agent"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/logger"
 )
 
 type AuthClient struct {
@@ -50,7 +52,6 @@ func NewAuthClient(clientCfg constant.ClientConfig, serverCfgs []constant.Server
 		serverCfgs:  serverCfgs,
 		clientCfg:   clientCfg,
 		agent:       agent,
-		tokenTtl:    5, // default refresh token 5 second, if first login error
 		accessToken: &atomic.Value{},
 	}
 
@@ -65,7 +66,7 @@ func (ac *AuthClient) GetAccessToken() string {
 	return v.(string)
 }
 
-func (ac *AuthClient) AutoRefresh() {
+func (ac *AuthClient) AutoRefresh(ctx context.Context) {
 
 	// If the username is not set, the automatic refresh Token is not enabled
 
@@ -74,16 +75,26 @@ func (ac *AuthClient) AutoRefresh() {
 	}
 
 	go func() {
-		timer := time.NewTimer(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
-
+		var timer *time.Timer
+		if lastLoginSuccess := ac.lastRefreshTime > 0 && ac.tokenTtl > 0 && ac.tokenRefreshWindow > 0; lastLoginSuccess {
+			timer = time.NewTimer(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
+		} else {
+			timer = time.NewTimer(time.Second * time.Duration(5))
+		}
+		defer timer.Stop()
 		for {
 			select {
 			case <-timer.C:
 				_, err := ac.Login()
 				if err != nil {
 					logger.Errorf("login has error %+v", err)
+					timer.Reset(time.Second * time.Duration(5))
+				} else {
+					logger.Infof("login success, tokenTtl: %+v seconds, tokenRefreshWindow: %+v seconds", ac.tokenTtl, ac.tokenRefreshWindow)
+					timer.Reset(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
 				}
-				timer.Reset(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
@@ -99,6 +110,14 @@ func (ac *AuthClient) Login() (bool, error) {
 		}
 	}
 	return false, throwable
+}
+
+func (ac *AuthClient) UpdateServerList(serverList []constant.ServerConfig) {
+	ac.serverCfgs = serverList
+}
+
+func (ac *AuthClient) GetServerList() []constant.ServerConfig {
+	return ac.serverCfgs
 }
 
 func (ac *AuthClient) login(server constant.ServerConfig) (bool, error) {
@@ -132,13 +151,13 @@ func (ac *AuthClient) login(server constant.ServerConfig) (bool, error) {
 		}
 
 		var bytes []byte
-		bytes, err = ioutil.ReadAll(resp.Body)
+		bytes, err = io.ReadAll(resp.Body)
 		defer resp.Body.Close()
 		if err != nil {
 			return false, err
 		}
 
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != constant.RESPONSE_CODE_SUCCESS {
 			errMsg := string(bytes)
 			return false, errors.New(errMsg)
 		}
@@ -153,6 +172,7 @@ func (ac *AuthClient) login(server constant.ServerConfig) (bool, error) {
 
 		if val, ok := result[constant.KEY_ACCESS_TOKEN]; ok {
 			ac.accessToken.Store(val)
+			ac.lastRefreshTime = time.Now().Unix()
 			ac.tokenTtl = int64(result[constant.KEY_TOKEN_TTL].(float64))
 			ac.tokenRefreshWindow = ac.tokenTtl / 10
 		}
