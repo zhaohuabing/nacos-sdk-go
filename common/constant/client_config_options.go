@@ -20,9 +20,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/nacos-group/nacos-sdk-go/common/file"
-	"github.com/nacos-group/nacos-sdk-go/common/logger"
-	"gopkg.in/natefinch/lumberjack.v2"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/file"
 )
 
 func NewClientConfig(opts ...ClientOption) *ClientConfig {
@@ -48,17 +46,17 @@ func NewClientConfig(opts ...ClientOption) *ClientConfig {
 // ClientOption ...
 type ClientOption func(*ClientConfig)
 
-// WithCustomLogger ...
-func WithCustomLogger(logger logger.Logger) ClientOption {
-	return func(config *ClientConfig) {
-		config.CustomLogger = logger
-	}
-}
-
 // WithTimeoutMs ...
 func WithTimeoutMs(timeoutMs uint64) ClientOption {
 	return func(config *ClientConfig) {
 		config.TimeoutMs = timeoutMs
+	}
+}
+
+// WithAppName ...
+func WithAppName(appName string) ClientOption {
+	return func(config *ClientConfig) {
+		config.AppName = appName
 	}
 }
 
@@ -80,6 +78,27 @@ func WithNamespaceId(namespaceId string) ClientOption {
 func WithEndpoint(endpoint string) ClientOption {
 	return func(config *ClientConfig) {
 		config.Endpoint = endpoint
+	}
+}
+
+// WithEndpointContextPath ...
+func WithEndpointContextPath(endpointContextPath string) ClientOption {
+	return func(config *ClientConfig) {
+		config.EndpointContextPath = endpointContextPath
+	}
+}
+
+// WithEndpointQueryParams ...
+func WithEndpointQueryParams(endpointQueryPrams string) ClientOption {
+	return func(config *ClientConfig) {
+		config.EndpointQueryParams = endpointQueryPrams
+	}
+}
+
+// WithClusterName ...
+func WithClusterName(clusterName string) ClientOption {
+	return func(config *ClientConfig) {
+		config.ClusterName = clusterName
 	}
 }
 
@@ -111,10 +130,36 @@ func WithOpenKMS(openKMS bool) ClientOption {
 	}
 }
 
+// WithOpenKMS ...
+func WithKMSVersion(kmsVersion KMSVersion) ClientOption {
+	return func(config *ClientConfig) {
+		config.KMSVersion = kmsVersion
+	}
+}
+
+func WithKMSv3Config(kmsv3Config *KMSv3Config) ClientOption {
+	return func(config *ClientConfig) {
+		config.KMSv3Config = kmsv3Config
+	}
+}
+
+func WithKMSConfig(kmsConfig *KMSConfig) ClientOption {
+	return func(config *ClientConfig) {
+		config.KMSConfig = kmsConfig
+	}
+}
+
 // WithCacheDir ...
 func WithCacheDir(cacheDir string) ClientOption {
 	return func(config *ClientConfig) {
 		config.CacheDir = cacheDir
+	}
+}
+
+// WithDisableUseSnapShot ...
+func WithDisableUseSnapShot(disableUseSnapShot bool) ClientOption {
+	return func(config *ClientConfig) {
+		config.DisableUseSnapShot = disableUseSnapShot
 	}
 }
 
@@ -170,13 +215,26 @@ func WithLogLevel(logLevel string) ClientOption {
 // WithLogSampling ...
 func WithLogSampling(tick time.Duration, initial int, thereafter int) ClientOption {
 	return func(config *ClientConfig) {
-		config.LogSampling = &logger.SamplingConfig{Initial: initial, Thereafter: thereafter, Tick: tick}
+		config.LogSampling = &ClientLogSamplingConfig{initial, thereafter, tick}
 	}
 }
 
 // WithLogRollingConfig ...
-func WithLogRollingConfig(rollingConfig *lumberjack.Logger) ClientOption {
+func WithLogRollingConfig(rollingConfig *ClientLogRollingConfig) ClientOption {
 	return func(config *ClientConfig) {
 		config.LogRollingConfig = rollingConfig
+	}
+}
+
+func WithTLS(tlsCfg TLSConfig) ClientOption {
+	return func(config *ClientConfig) {
+		tlsCfg.Appointed = true
+		config.TLSCfg = tlsCfg
+	}
+}
+
+func WithAppConnLabels(appConnLabels map[string]string) ClientOption {
+	return func(config *ClientConfig) {
+		config.AppConnLabels = appConnLabels
 	}
 }

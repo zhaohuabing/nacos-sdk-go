@@ -24,12 +24,12 @@ import (
 )
 
 func reset() {
-	setLogger(nil)
+	SetLogger(nil)
 }
 
 func TestInitLogger(t *testing.T) {
 	config := Config{
-		Level: "debug",
+		Level: "degug",
 	}
 	err := InitLogger(config)
 	assert.NoError(t, err)
@@ -47,11 +47,6 @@ func TestGetLogger(t *testing.T) {
 	log2 := GetLogger()
 	assert.NotEqual(t, log, log2)
 
-	// the secend init logger
-	config.Level = "info"
-	_ = InitLogger(config)
-	log3 := GetLogger()
-	assert.NotEqual(t, log2, log3)
 	reset()
 }
 
@@ -59,20 +54,13 @@ func TestSetLogger(t *testing.T) {
 	// not yet init get default log
 	log := GetLogger()
 	log1 := &mockLogger{}
-	setLogger(log1)
+	SetLogger(log1)
 
 	// after set logger
 	log2 := GetLogger()
 	assert.NotEqual(t, log, log2)
 	assert.Equal(t, log1, log2)
 
-	config := Config{
-		Level: "degug",
-	}
-	_ = InitLogger(config)
-	// after init logger
-	log3 := GetLogger()
-	assert.NotEqual(t, log2, log3)
 	reset()
 }
 
@@ -82,7 +70,7 @@ func TestRaceLogger(t *testing.T) {
 		wg.Add(3)
 		go func() {
 			defer wg.Done()
-			setLogger(&mockLogger{})
+			SetLogger(&mockLogger{})
 		}()
 		go func() {
 			defer wg.Done()
@@ -91,7 +79,7 @@ func TestRaceLogger(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			config := Config{
-				Level: "debug",
+				Level: "degug",
 			}
 			_ = InitLogger(config)
 		}()

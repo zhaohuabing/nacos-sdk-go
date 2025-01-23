@@ -1,36 +1,127 @@
-/*
- * Copyright 1999-2020 Alibaba Group Holding Ltd.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package cache
 
 import (
-	"runtime"
+	"fmt"
+	"github.com/nacos-group/nacos-sdk-go/v2/util"
+	"math/rand"
+	"os"
+	"strconv"
 	"testing"
 
-	"github.com/nacos-group/nacos-sdk-go/common/constant"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/common/file"
 )
 
-func TestGetFileName(t *testing.T) {
+var (
+	dir   = file.GetCurrentPath()
+	group = "FILE_GROUP"
+	ns    = "chasu"
+)
 
-	name := GetFileName("nacos@@providers:org.apache.dubbo.UserProvider:hangzhou", "tmp")
+func TestWriteAndGetConfigToFile(t *testing.T) {
+	dataIdSuffix := strconv.Itoa(rand.Intn(1000))
+	t.Run("write and get config content", func(t *testing.T) {
+		dataId := "config_content" + dataIdSuffix
+		cacheKey := util.GetConfigCacheKey(dataId, group, ns)
+		configContent := "config content"
 
-	if runtime.GOOS == constant.OS_WINDOWS {
-		assert.Equal(t, name, "tmp\\nacos@@providers&&org.apache.dubbo.UserProvider&&hangzhou")
-	} else {
-		assert.Equal(t, name, "tmp/nacos@@providers:org.apache.dubbo.UserProvider:hangzhou")
-	}
+		err := WriteConfigToFile(cacheKey, dir, "")
+		assert.Nil(t, err)
+
+		configFromFile, err := ReadConfigFromFile(cacheKey, dir)
+		assert.NotNil(t, err)
+		assert.Equal(t, configFromFile, "")
+
+		err = WriteConfigToFile(cacheKey, dir, configContent)
+		assert.Nil(t, err)
+
+		fromFile, err := ReadConfigFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, fromFile, configContent)
+
+		err = WriteConfigToFile(cacheKey, dir, "")
+		assert.Nil(t, err)
+
+		configFromFile, err = ReadConfigFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, configFromFile, "")
+	})
+
+	t.Run("write and get config encryptedDataKey", func(t *testing.T) {
+		dataId := "config_encryptedDataKey" + dataIdSuffix
+		cacheKey := util.GetConfigCacheKey(dataId, group, ns)
+		configContent := "config encrypted data key"
+
+		err := WriteEncryptedDataKeyToFile(cacheKey, dir, "")
+		assert.Nil(t, err)
+
+		configFromFile, err := ReadEncryptedDataKeyFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, configFromFile, "")
+
+		err = WriteEncryptedDataKeyToFile(cacheKey, dir, configContent)
+		assert.Nil(t, err)
+
+		fromFile, err := ReadEncryptedDataKeyFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, fromFile, configContent)
+
+		err = WriteEncryptedDataKeyToFile(cacheKey, dir, "")
+		assert.Nil(t, err)
+
+		configFromFile, err = ReadEncryptedDataKeyFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, configFromFile, "")
+	})
+	t.Run("double write config file", func(t *testing.T) {
+		dataId := "config_encryptedDataKey" + dataIdSuffix
+		cacheKey := util.GetConfigCacheKey(dataId, group, ns)
+		configContent := "config encrypted data key"
+
+		err := WriteConfigToFile(cacheKey, dir, configContent)
+		assert.Nil(t, err)
+
+		err = WriteConfigToFile(cacheKey, dir, configContent)
+		assert.Nil(t, err)
+
+		fromFile, err := ReadConfigFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+		assert.Equal(t, fromFile, configContent)
+	})
+	t.Run("read doesn't existed config file", func(t *testing.T) {
+		dataId := "config_encryptedDataKey" + dataIdSuffix + strconv.Itoa(rand.Intn(1000))
+		cacheKey := util.GetConfigCacheKey(dataId, group, ns)
+
+		_, err := ReadConfigFromFile(cacheKey, dir)
+		assert.NotNil(t, err)
+
+		_, err = ReadEncryptedDataKeyFromFile(cacheKey, dir)
+		assert.Nil(t, err)
+	})
+}
+
+func TestGetFailover(t *testing.T) {
+	cacheKey := "test_failOver"
+	fileContent := "test_failover"
+	t.Run("writeContent", func(t *testing.T) {
+		filepath := dir + string(os.PathSeparator) + cacheKey + "_failover"
+		fmt.Println(filepath)
+		err := writeFileContent(filepath, fileContent)
+		assert.Nil(t, err)
+	})
+	t.Run("getContent", func(t *testing.T) {
+		content := GetFailover(cacheKey, dir)
+		assert.Equal(t, content, fileContent)
+	})
+	t.Run("clearContent", func(t *testing.T) {
+		filepath := dir + string(os.PathSeparator) + cacheKey + "_failover"
+		err := writeFileContent(filepath, "")
+		assert.Nil(t, err)
+	})
+}
+
+// write file content
+func writeFileContent(filepath, content string) error {
+	return os.WriteFile(filepath, []byte(content), 0666)
 }
