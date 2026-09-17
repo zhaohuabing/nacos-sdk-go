@@ -18,23 +18,26 @@ package http_agent
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-func get(path string, header http.Header, timeoutMs uint64, params map[string]string) (response *http.Response, err error) {
-	if !strings.HasSuffix(path, "?") {
+func get(client *http.Client, path string, header http.Header, timeoutMs uint64, params map[string]string) (response *http.Response, err error) {
+	if !strings.Contains(path, "?") {
 		path = path + "?"
 	}
 
 	for key, value := range params {
-		path = path + key + "=" + value + "&"
+		if !strings.HasSuffix(path, "&") {
+			path = path + "&"
+		}
+		path = path + key + "=" + url.QueryEscape(value) + "&"
 	}
 	if strings.HasSuffix(path, "&") {
 		path = path[:len(path)-1]
 	}
 
-	client := http.Client{}
 	client.Timeout = time.Millisecond * time.Duration(timeoutMs)
 	request, errNew := http.NewRequest(http.MethodGet, path, nil)
 	if errNew != nil {

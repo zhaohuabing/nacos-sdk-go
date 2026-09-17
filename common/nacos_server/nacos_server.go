@@ -17,75 +17,91 @@
 package nacos_server
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
-	"errors"
-	"fmt"
-	"io/ioutil"
+	"context"
+	"io"
 	"math/rand"
 	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/nacos-group/nacos-sdk-go/common/constant"
-	"github.com/nacos-group/nacos-sdk-go/common/http_agent"
-	"github.com/nacos-group/nacos-sdk-go/common/logger"
-	"github.com/nacos-group/nacos-sdk-go/common/nacos_error"
-	"github.com/nacos-group/nacos-sdk-go/common/security"
-	"github.com/nacos-group/nacos-sdk-go/inner/uuid"
-	"github.com/nacos-group/nacos-sdk-go/util"
+	"github.com/pkg/errors"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/common/monitor"
+
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/http_agent"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/nacos_error"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/security"
+	"github.com/nacos-group/nacos-sdk-go/v2/inner/uuid"
+	"github.com/nacos-group/nacos-sdk-go/v2/util"
 )
 
 type NacosServer struct {
 	sync.RWMutex
-	securityLogin       security.AuthClient
-	serverList          []constant.ServerConfig
-	httpAgent           http_agent.IHttpAgent
-	timeoutMs           uint64
-	endpoint            string
-	lastSrvRefTime      int64
-	vipSrvRefInterMills int64
-	contextPath         string
+	securityLogin         security.SecurityProxy
+	serverList            []constant.ServerConfig
+	httpAgent             http_agent.IHttpAgent
+	timeoutMs             uint64
+	endpoint              string
+	lastSrvRefTime        int64
+	vipSrvRefInterMills   int64
+	contextPath           string
+	endpointContextPath   string
+	endpointQueryParams   string
+	endpointQueryHeader   map[string][]string
+	clusterName           string
+	currentIndex          int32
+	ServerSrcChangeSignal chan struct{}
 }
 
-func NewNacosServer(serverList []constant.ServerConfig, clientCfg constant.ClientConfig, httpAgent http_agent.IHttpAgent, timeoutMs uint64, endpoint string) (*NacosServer, error) {
-	if len(serverList) == 0 && endpoint == "" {
+func NewNacosServer(ctx context.Context, serverList []constant.ServerConfig, clientCfg constant.ClientConfig, httpAgent http_agent.IHttpAgent, timeoutMs uint64, endpoint string, endpointQueryHeader map[string][]string) (*NacosServer, error) {
+	return NewNacosServerWithRamCredentialProvider(ctx, serverList, clientCfg, httpAgent, timeoutMs, endpoint, endpointQueryHeader, nil)
+}
+
+func NewNacosServerWithRamCredentialProvider(ctx context.Context, serverList []constant.ServerConfig, clientCfg constant.ClientConfig, httpAgent http_agent.IHttpAgent, timeoutMs uint64, endpoint string, endpointQueryHeader map[string][]string, provider security.RamCredentialProvider) (*NacosServer, error) {
+	severLen := len(serverList)
+	if severLen == 0 && endpoint == "" {
 		return &NacosServer{}, errors.New("both serverlist  and  endpoint are empty")
 	}
 
-	securityLogin := security.NewAuthClient(clientCfg, serverList, httpAgent)
+	securityLogin := security.NewSecurityProxyWithRamCredentialProvider(clientCfg, serverList, httpAgent, provider)
 
 	ns := NacosServer{
-		serverList:          serverList,
-		securityLogin:       securityLogin,
-		httpAgent:           httpAgent,
-		timeoutMs:           timeoutMs,
-		endpoint:            endpoint,
-		vipSrvRefInterMills: 10000,
-		contextPath:         clientCfg.ContextPath,
+		serverList:            serverList,
+		securityLogin:         securityLogin,
+		httpAgent:             httpAgent,
+		timeoutMs:             timeoutMs,
+		endpoint:              endpoint,
+		vipSrvRefInterMills:   10000,
+		endpointContextPath:   clientCfg.EndpointContextPath,
+		endpointQueryParams:   clientCfg.EndpointQueryParams,
+		endpointQueryHeader:   endpointQueryHeader,
+		clusterName:           clientCfg.ClusterName,
+		contextPath:           clientCfg.ContextPath,
+		ServerSrcChangeSignal: make(chan struct{}, 1),
 	}
-	ns.initRefreshSrvIfNeed()
-	_, err := securityLogin.Login()
-
-	if err != nil {
-		logger.Errorf("login has error %+v", err)
+	if severLen > 0 {
+		ns.currentIndex = rand.Int31n(int32(severLen))
+	} else {
+		ns.initRefreshSrvIfNeed(ctx)
 	}
 
-	securityLogin.AutoRefresh()
+	ns.securityLogin.Login()
+	ns.securityLogin.AutoRefresh(ctx)
 	return &ns, nil
 }
 
 func (server *NacosServer) callConfigServer(api string, params map[string]string, newHeaders map[string]string,
 	method string, curServer string, contextPath string, timeoutMS uint64) (result string, err error) {
+	start := time.Now()
 	if contextPath == "" {
 		contextPath = constant.WEB_CONTEXT
 	}
-
-	signHeaders := getSignHeaders(params, newHeaders)
 
 	url := curServer + contextPath + api
 
@@ -105,26 +121,22 @@ func (server *NacosServer) callConfigServer(api string, params map[string]string
 		return
 	}
 	headers["RequestId"] = []string{uid.String()}
-	headers["Request-Module"] = []string{"Naming"}
 	headers["Content-Type"] = []string{"application/x-www-form-urlencoded;charset=utf-8"}
-	headers["Spas-AccessKey"] = []string{newHeaders["accessKey"]}
-	headers["Timestamp"] = []string{signHeaders["timeStamp"]}
-	headers["Spas-Signature"] = []string{signHeaders["Spas-Signature"]}
-	injectSecurityInfo(server, params)
 
 	var response *http.Response
 	response, err = server.httpAgent.Request(method, url, headers, timeoutMS, params)
+	monitor.GetConfigRequestMonitor(method, url, util.GetStatusCode(response)).Observe(float64(time.Now().Nanosecond() - start.Nanosecond()))
 	if err != nil {
 		return
 	}
 	var bytes []byte
-	bytes, err = ioutil.ReadAll(response.Body)
+	bytes, err = io.ReadAll(response.Body)
 	defer response.Body.Close()
 	if err != nil {
 		return
 	}
 	result = string(bytes)
-	if response.StatusCode == 200 {
+	if response.StatusCode == constant.RESPONSE_CODE_SUCCESS {
 		return
 	} else {
 		err = nacos_error.NewNacosError(strconv.Itoa(response.StatusCode), string(bytes), nil)
@@ -133,6 +145,7 @@ func (server *NacosServer) callConfigServer(api string, params map[string]string
 }
 
 func (server *NacosServer) callServer(api string, params map[string]string, method string, curServer string, contextPath string) (result string, err error) {
+	start := time.Now()
 	if contextPath == "" {
 		contextPath = constant.WEB_CONTEXT
 	}
@@ -152,24 +165,23 @@ func (server *NacosServer) callServer(api string, params map[string]string, meth
 	headers["Request-Module"] = []string{"Naming"}
 	headers["Content-Type"] = []string{"application/x-www-form-urlencoded;charset=utf-8"}
 
-	injectSecurityInfo(server, params)
-
 	var response *http.Response
 	response, err = server.httpAgent.Request(method, url, headers, server.timeoutMs, params)
 	if err != nil {
 		return
 	}
 	var bytes []byte
-	bytes, err = ioutil.ReadAll(response.Body)
+	bytes, err = io.ReadAll(response.Body)
 	defer response.Body.Close()
 	if err != nil {
 		return
 	}
 	result = string(bytes)
-	if response.StatusCode == 200 {
+	monitor.GetNamingRequestMonitor(method, api, util.GetStatusCode(response)).Observe(float64(time.Now().Nanosecond() - start.Nanosecond()))
+	if response.StatusCode == constant.RESPONSE_CODE_SUCCESS {
 		return
 	} else {
-		err = errors.New(fmt.Sprintf("request return error code %d", response.StatusCode))
+		err = errors.Errorf("request return error code %d", response.StatusCode)
 		return
 	}
 }
@@ -180,7 +192,7 @@ func (server *NacosServer) ReqConfigApi(api string, params map[string]string, he
 		return "", errors.New("server list is empty")
 	}
 
-	injectSecurityInfo(server, params)
+	server.InjectSecurityInfo(params, security.BuildConfigResource(params["tenant"], params["group"], params["dataId"]))
 
 	//only one server,retry request when error
 	var err error
@@ -193,7 +205,6 @@ func (server *NacosServer) ReqConfigApi(api string, params map[string]string, he
 			}
 			logger.Errorf("api<%s>,method:<%s>, params:<%s>, call domain error:<%+v> , result:<%s>", api, method, util.ToJsonString(params), err, result)
 		}
-		return "", err
 	} else {
 		index := rand.Intn(len(srvs))
 		for i := 1; i <= len(srvs); i++ {
@@ -205,22 +216,21 @@ func (server *NacosServer) ReqConfigApi(api string, params map[string]string, he
 			logger.Errorf("[ERROR] api<%s>,method:<%s>, params:<%s>, call domain error:<%+v> , result:<%s> \n", api, method, util.ToJsonString(params), err, result)
 			index = (index + i) % len(srvs)
 		}
-		return "", err
 	}
+	return "", errors.Wrapf(err, "retry %d times request failed!", constant.REQUEST_DOMAIN_RETRY_TIME)
 }
 
-func (server *NacosServer) ReqApi(api string, params map[string]string, method string) (string, error) {
+func (server *NacosServer) ReqApi(api string, params map[string]string, method string, config constant.ClientConfig) (string, error) {
 	srvs := server.serverList
 	if srvs == nil || len(srvs) == 0 {
 		return "", errors.New("server list is empty")
 	}
-	var (
-		result string
-		err    error
-	)
-	injectSecurityInfo(server, params)
+
+	server.InjectSecurityInfo(params, security.BuildNamingResource(params["namespaceId"], params["serviceName"], params["groupName"]))
 
 	//only one server,retry request when error
+	var err error
+	var result string
 	if len(srvs) == 1 {
 		for i := 0; i < constant.REQUEST_DOMAIN_RETRY_TIME; i++ {
 			result, err = server.callServer(api, params, method, getAddress(srvs[0]), srvs[0].ContextPath)
@@ -241,33 +251,51 @@ func (server *NacosServer) ReqApi(api string, params map[string]string, method s
 			index = (index + i) % len(srvs)
 		}
 	}
-	return "", fmt.Errorf("retry%stimes request failed,err=%v", strconv.Itoa(constant.REQUEST_DOMAIN_RETRY_TIME), err)
+	return "", errors.Wrapf(err, "retry %d times request failed!", constant.REQUEST_DOMAIN_RETRY_TIME)
 }
 
-func (server *NacosServer) initRefreshSrvIfNeed() {
+func (server *NacosServer) initRefreshSrvIfNeed(ctx context.Context) {
 	if server.endpoint == "" {
 		return
 	}
-	server.refreshServerSrvIfNeed()
+
+	if len(strings.TrimSpace(server.endpointContextPath)) == 0 {
+		server.endpointContextPath = "nacos"
+	}
+
+	if len(strings.TrimSpace(server.clusterName)) == 0 {
+		server.clusterName = "serverlist"
+	}
+	urlString := "http://" + server.endpoint + "/" + strings.TrimSpace(server.endpointContextPath) + "/" + strings.TrimSpace(server.clusterName)
+	if len(strings.TrimSpace(server.endpointQueryParams)) != 0 {
+		urlString += "?" + server.endpointQueryParams
+	}
+	logger.Infof("nacos address server url: <%s>", urlString)
+
+	server.refreshServerSrvIfNeed(urlString, server.endpointQueryHeader)
 	go func() {
 		for {
-			time.Sleep(time.Duration(1) * time.Second)
-			server.refreshServerSrvIfNeed()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(time.Duration(10) * time.Second)
+				server.refreshServerSrvIfNeed(urlString, server.endpointQueryHeader)
+			}
 		}
 	}()
 
 }
 
-func (server *NacosServer) refreshServerSrvIfNeed() {
-	if len(server.serverList) > 0 || util.CurrentMillis()-server.lastSrvRefTime < server.vipSrvRefInterMills {
+func (server *NacosServer) refreshServerSrvIfNeed(urlString string, header map[string][]string) {
+	if util.CurrentMillis()-server.lastSrvRefTime < server.vipSrvRefInterMills && len(server.serverList) > 0 {
 		return
 	}
 
 	var list []string
-	urlString := "http://" + server.endpoint + "/nacos/serverlist"
-	result := server.httpAgent.RequestOnlyResult(http.MethodGet, urlString, nil, server.timeoutMs, nil)
+
+	result := server.httpAgent.RequestOnlyResult(http.MethodGet, urlString, header, server.timeoutMs, nil)
 	list = strings.Split(result, "\n")
-	logger.Infof("http nacos server list: <%s>", result)
 
 	var servers []constant.ServerConfig
 	contextPath := server.contextPath
@@ -293,9 +321,15 @@ func (server *NacosServer) refreshServerSrvIfNeed() {
 	if len(servers) > 0 {
 		if !reflect.DeepEqual(server.serverList, servers) {
 			server.Lock()
-			logger.Infof("server list is updated, old: <%v>,new:<%v>", server.serverList, servers)
+			var serverPrev = server.serverList
+			logger.Infof("server list is updated, old: <%v>,new:<%v>", serverPrev, servers)
+
 			server.serverList = servers
+			if serverPrev != nil {
+				server.ServerSrcChangeSignal <- struct{}{}
+			}
 			server.lastSrvRefTime = util.CurrentMillis()
+			server.securityLogin.UpdateServerList(servers)
 			server.Unlock()
 		}
 
@@ -307,11 +341,15 @@ func (server *NacosServer) GetServerList() []constant.ServerConfig {
 	return server.serverList
 }
 
-func injectSecurityInfo(server *NacosServer, param map[string]string) {
-	accessToken := server.securityLogin.GetAccessToken()
-	if accessToken != "" {
-		param[constant.KEY_ACCESS_TOKEN] = accessToken
+func (server *NacosServer) InjectSecurityInfo(param map[string]string, resource security.RequestResource) {
+	securityInfo := server.securityLogin.GetSecurityInfo(resource)
+	for k, v := range securityInfo {
+		param[k] = v
 	}
+}
+
+func (server *NacosServer) ReLogin() {
+	server.securityLogin.ReLogin()
 }
 
 func getAddress(cfg constant.ServerConfig) string {
@@ -321,38 +359,11 @@ func getAddress(cfg constant.ServerConfig) string {
 	return cfg.Scheme + "://" + cfg.IpAddr + ":" + strconv.Itoa(int(cfg.Port))
 }
 
-func getSignHeaders(params map[string]string, newHeaders map[string]string) map[string]string {
-	resource := ""
-
-	if len(params["tenant"]) != 0 {
-		resource = params["tenant"] + "+" + params["group"]
-	} else {
-		resource = params["group"]
+func (server *NacosServer) GetNextServer() (constant.ServerConfig, error) {
+	serverLen := len(server.GetServerList())
+	if serverLen == 0 {
+		return constant.ServerConfig{}, errors.New("server is empty")
 	}
-
-	headers := map[string]string{}
-
-	timeStamp := strconv.FormatInt(time.Now().UnixNano()/1e6, 10)
-	headers["timeStamp"] = timeStamp
-
-	signature := ""
-
-	if resource == "" {
-		signature = signWithhmacSHA1Encrypt(timeStamp, newHeaders["secretKey"])
-	} else {
-		signature = signWithhmacSHA1Encrypt(resource+"+"+timeStamp, newHeaders["secretKey"])
-	}
-
-	headers["Spas-Signature"] = signature
-
-	return headers
-}
-
-func signWithhmacSHA1Encrypt(encryptText, encryptKey string) string {
-	//hmac ,use sha1
-	key := []byte(encryptKey)
-	mac := hmac.New(sha1.New, key)
-	mac.Write([]byte(encryptText))
-
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	index := atomic.AddInt32(&server.currentIndex, 1) % int32(serverLen)
+	return server.GetServerList()[index], nil
 }

@@ -19,13 +19,17 @@ package util
 import (
 	"encoding/json"
 	"net"
+	"net/http"
 	"net/url"
+	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/nacos-group/nacos-sdk-go/common/constant"
-	"github.com/nacos-group/nacos-sdk-go/common/logger"
-	"github.com/nacos-group/nacos-sdk-go/model"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v2/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v2/model"
 )
 
 func CurrentMillis() int64 {
@@ -65,91 +69,92 @@ func GetConfigCacheKey(dataId string, group string, tenant string) string {
 	return dataId + constant.CONFIG_INFO_SPLITER + group + constant.CONFIG_INFO_SPLITER + tenant
 }
 
+// Environment variable key for overriding the client IP.
+// This takes highest priority, useful for containerized environments (e.g., K8s Pod spec).
+const EnvNacosClientLocalIP = "NACOS_CLIENT_LOCAL_IP"
+
 var (
-	localIP     = ""
-	privateCIDR []*net.IPNet
+	resolvedIP   string
+	ipOnce       sync.Once
+	configuredIP atomic.Value // string; set via SetClientIPFromConfig before first LocalIP() call
 )
 
-func LocalIP() string {
-	if localIP != "" {
-		return localIP
-	}
+// SetClientIPFromConfig stores the IP from ClientConfig.ClientIP.
+// Typically called by the client factory during initialization before any LocalIP() invocation.
+// This value has second priority after the NACOS_CLIENT_LOCAL_IP environment variable.
+// Uses atomic.Value so concurrent calls and concurrent LocalIP() reads are race-free.
+func SetClientIPFromConfig(ip string) {
+	configuredIP.Store(ip)
+}
 
-	faces, err := getFaces()
+func getConfiguredIP() string {
+	v := configuredIP.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// LocalIP returns the client IP address. Resolution happens exactly once with the following priority:
+//  1. NACOS_CLIENT_LOCAL_IP environment variable (highest, zero code change needed)
+//  2. ClientConfig.ClientIP set via WithClientIP option
+//  3. Auto-detected from network interfaces (first non-loopback IPv4)
+func LocalIP() string {
+	ipOnce.Do(func() {
+		// Priority 1: environment variable
+		if envIP := os.Getenv(EnvNacosClientLocalIP); envIP != "" {
+			resolvedIP = envIP
+			logger.Infof("Using client IP from environment variable %s: %s", EnvNacosClientLocalIP, resolvedIP)
+			return
+		}
+		// Priority 2: ClientConfig.ClientIP
+		if cfg := getConfiguredIP(); cfg != "" {
+			resolvedIP = cfg
+			logger.Infof("Using client IP from ClientConfig: %s", resolvedIP)
+			return
+		}
+		// Priority 3: auto-detect from network interfaces
+		resolvedIP = detectLocalIP()
+		if resolvedIP != "" {
+			logger.Infof("Local IP:%s", resolvedIP)
+		}
+	})
+	return resolvedIP
+}
+
+// detectLocalIP scans network interfaces and returns the first non-loopback IPv4 address.
+func detectLocalIP() string {
+	netInterfaces, err := net.Interfaces()
 	if err != nil {
+		logger.Errorf("get Interfaces failed,err:%+v", err)
 		return ""
 	}
 
-	for _, address := range faces {
-		ipNet, ok := address.(*net.IPNet)
-		if !ok || ipNet.IP.To4() == nil || isFilteredIP(ipNet.IP) {
-			continue
+	for i := 0; i < len(netInterfaces); i++ {
+		if ((netInterfaces[i].Flags & net.FlagUp) != 0) && ((netInterfaces[i].Flags & net.FlagLoopback) == 0) {
+			addrs, err := netInterfaces[i].Addrs()
+			if err != nil {
+				logger.Errorf("get InterfaceAddress failed,err:%+v", err)
+				return ""
+			}
+			for _, address := range addrs {
+				if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+					return ipnet.IP.String()
+				}
+			}
 		}
-
-		localIP = ipNet.IP.String()
-		break
 	}
-
-	if localIP != "" {
-		logger.Infof("Local IP:%s", localIP)
-	}
-
-	return localIP
+	return ""
 }
 
-// SetFilterNetNumberAndMask ipMask like 127.0.0.0/8
-func SetFilterNetNumberAndMask(ipMask ...string) error {
-	var (
-		err   error
-		ipNet *net.IPNet
-	)
-	for _, b := range ipMask {
-		_, ipNet, err = net.ParseCIDR(b)
-		if err != nil {
-			return err
-		}
-		privateCIDR = append(privateCIDR, ipNet)
-	}
-	return err
-}
-
-// getFaces return addresses from interfaces that is up
-func getFaces() ([]net.Addr, error) {
-	var upAddrs []net.Addr
-
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		logger.Errorf("get Interfaces failed,err:%+v", err)
-		return nil, err
-	}
-
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		if (iface.Flags & net.FlagLoopback) != 0 {
-			continue
-		}
-
-		addresses, err := iface.Addrs()
-		if err != nil {
-			logger.Errorf("get InterfaceAddress failed,err:%+v", err)
-			return nil, err
-		}
-
-		upAddrs = append(upAddrs, addresses...)
-	}
-
-	return upAddrs, nil
-}
-
-func isFilteredIP(ip net.IP) bool {
-	for _, privateIP := range privateCIDR {
-		if privateIP.Contains(ip) {
-			return true
-		}
-	}
-	return false
+// resetLocalIPForTesting resets the IP resolution state. FOR TESTING ONLY.
+// Lowercase intentionally: this helper must NOT be part of the public API,
+// otherwise external callers could wipe an already-resolved IP at runtime.
+func resetLocalIPForTesting() {
+	resolvedIP = ""
+	configuredIP = atomic.Value{}
+	ipOnce = sync.Once{}
 }
 
 func GetDurationWithDefault(metadata map[string]string, key string, defaultDuration time.Duration) time.Duration {
@@ -174,10 +179,30 @@ func GetUrlFormedMap(source map[string]string) (urlEncoded string) {
 	return
 }
 
+// get status code by response,default is NA
+func GetStatusCode(response *http.Response) string {
+	var statusCode string
+	if response != nil {
+		statusCode = strconv.Itoa(response.StatusCode)
+	} else {
+		statusCode = "NA"
+	}
+	return statusCode
+}
+
 func DeepCopyMap(params map[string]string) map[string]string {
 	result := make(map[string]string, len(params))
 	for k, v := range params {
 		result[k] = v
 	}
 	return result
+}
+
+func Contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
